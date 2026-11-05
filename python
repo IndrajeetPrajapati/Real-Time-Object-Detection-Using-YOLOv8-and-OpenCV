@@ -1,107 +1,392 @@
+import os
+import sys
+import time
+
 import cv2
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")                 # charts are saved as PNG files
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
 
-# Load YOLO model
-model = YOLO("yolov8n.pt")
+# ---------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------
+MODEL_NAME = "yolov8n.pt"
+CONF = 0.25
+IMGSZ = 640
 
-print("\n===== VEHICLE COUNTER =====")
-print("1. Live Camera")
-print("2. Video File")
-
-choice = input("Enter your choice (1/2): ")
-
-# COCO vehicle classes
-vehicle_classes = {
+# COCO class IDs
+VEHICLE_CLASSES = {
     2: "Car",
     3: "Motorcycle",
     5: "Bus",
-    7: "Truck"
+    7: "Truck",
 }
 
-# -----------------------------
-# Select Camera or Video
-# -----------------------------
-if choice == "1":
-    # Windows camera
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+ALL_CLASSES = {
+    0: "Person",
+    1: "Bicycle",
+    2: "Car",
+    3: "Motorcycle",
+    5: "Bus",
+    7: "Truck",
+    15: "Cat",
+    16: "Dog",
+    67: "Mobile Phone",      # called "cell phone" inside the COCO dataset
+}
 
-    # Camera resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-elif choice == "2":
-    video_path = "videos.mp4"
-    cap = cv2.VideoCapture(video_path)
+# ===============================================================
+# PART 1: LIVE DETECTION + COUNTING + SCORES
+# ===============================================================
+def run_detection(choice, model, mode):
+    classes = VEHICLE_CLASSES if mode == "1" else ALL_CLASSES
+    class_ids = list(classes.keys())
+    word = "Vehicles" if mode == "1" else "Objects"
 
-else:
-    print("Invalid choice")
-    exit()
+    # ---- Select camera or video ----
+    if choice == "1":
+        if sys.platform.startswith("win"):
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)   # Windows camera
+        else:
+            cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    else:
+        video_path = input("Enter video path (press Enter for videos.mp4): ").strip()
+        if video_path == "":
+            video_path = "videos.mp4"
+        if not os.path.exists(video_path):
+            print(f"ERROR: File '{video_path}' not found")
+            return
+        cap = cv2.VideoCapture(video_path)
 
-# Check camera/video
-if not cap.isOpened():
-    print("ERROR: Could not open camera/video")
-    exit()
+    if not cap.isOpened():
+        print("ERROR: Could not open camera/video")
+        return
 
-print("Camera/Video started successfully.")
-print("Press Q to quit.")
+    print("Camera/Video started successfully.")
+    print("Press Q to quit.")
 
-# -----------------------------
-# Detection Loop
-# -----------------------------
-while True:
+    # ---- Score tracking variables ----
+    use_track = True                                   # tracking gives a true total
+    unique_ids = {c: set() for c in class_ids}         # unique objects per type
+    detections = {c: 0 for c in class_ids}             # total boxes per type
+    conf_sum = {c: 0.0 for c in class_ids}             # for average confidence
+    all_confs = []
+    counts_per_frame = []
+    frame_count = 0
+    fps = 0.0
+    start_time = time.time()
 
-    ret, frame = cap.read()
+    # ---- Detection loop ----
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Could not read frame (video ended).")
+            break
 
-    if not ret:
-        print("Could not read frame.")
-        break
+        t0 = time.time()
 
-    # YOLO detection
-    results = model.predict(
-        source=frame,
-        conf=0.25,
-        imgsz=640,
-        classes=list(vehicle_classes.keys()),
-        verbose=False
-    )
+        # YOLO detection (with tracking if available)
+        if use_track:
+            try:
+                results = model.track(
+                    source=frame, persist=True, conf=CONF, imgsz=IMGSZ,
+                    classes=class_ids, tracker="bytetrack.yaml", verbose=False
+                )
+            except Exception as e:
+                print("Tracking not available, using normal detection:", e)
+                use_track = False
+                results = model.predict(
+                    source=frame, conf=CONF, imgsz=IMGSZ,
+                    classes=class_ids, verbose=False
+                )
+        else:
+            results = model.predict(
+                source=frame, conf=CONF, imgsz=IMGSZ,
+                classes=class_ids, verbose=False
+            )
 
-    # Draw boxes
-    annotated_frame = results[0].plot()
+        # Draw boxes
+        annotated_frame = results[0].plot()
 
-    # Count vehicles
-    vehicle_count = 0
+        # Count objects in this frame
+        boxes = results[0].boxes
+        object_count = 0
+        now_counts = {c: 0 for c in class_ids}
 
-    if results[0].boxes is not None:
-
-        for box in results[0].boxes:
-
-            if box.cls is not None:
-
+        if boxes is not None:
+            for box in boxes:
                 class_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                if class_id in classes:
+                    object_count += 1
+                    now_counts[class_id] += 1
+                    detections[class_id] += 1
+                    conf_sum[class_id] += conf
+                    all_confs.append(conf)
+                    if box.id is not None:
+                        unique_ids[class_id].add(int(box.id[0]))
 
-                if class_id in vehicle_classes:
-                    vehicle_count += 1
+        counts_per_frame.append(object_count)
+        frame_count += 1
 
-    # Display vehicle count
-    cv2.putText(
-        annotated_frame,
-        f"Vehicles: {vehicle_count}",
-        (20, 50),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.2,
-        (0, 255, 0),
-        3
-    )
+        # FPS (smoothed)
+        dt = time.time() - t0
+        if dt > 0:
+            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
 
-    # Display window
-    cv2.imshow("YOLO Vehicle Detection", annotated_frame)
+        total_unique = sum(len(s) for s in unique_ids.values())
+        avg_conf = (sum(all_confs) / len(all_confs)) if all_confs else 0.0
 
-    # Press Q
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+        # ---- On-screen score panel ----
+        lines = [f"{word} now: {object_count}"]
+        if use_track:
+            lines.append(f"Total counted: {total_unique}")
+        for cid, cname in classes.items():
+            if use_track:
+                lines.append(f"{cname}: {now_counts[cid]}  (total {len(unique_ids[cid])})")
+            else:
+                lines.append(f"{cname}: {now_counts[cid]}")
+        lines.append(f"Avg confidence: {avg_conf:.2f}")
+        lines.append(f"FPS: {fps:.1f}")
 
-# -----------------------------
-# Release
-# -----------------------------
-cap.release()
-cv2.destroyAllWindows()
+        line_h = 28
+        panel_h = 20 + line_h * len(lines)
+        cv2.rectangle(annotated_frame, (10, 10), (400, 10 + panel_h), (0, 0, 0), -1)
+        for i, text in enumerate(lines):
+            color = (0, 255, 0) if i == 0 else (255, 255, 255)
+            cv2.putText(annotated_frame, text, (20, 38 + line_h * i),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Display window
+        cv2.imshow("YOLO Object Detection", annotated_frame)
+
+        # Press Q
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    # ---- Release ----
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # ===========================================================
+    # FINAL SCORE SUMMARY (table + chart)
+    # ===========================================================
+    if frame_count == 0:
+        print("No frames processed.")
+        return
+
+    elapsed = time.time() - start_time
+    avg_fps = frame_count / elapsed
+    avg_conf = (sum(all_confs) / len(all_confs)) if all_confs else 0.0
+    avg_per_frame = sum(counts_per_frame) / frame_count
+    max_in_frame = max(counts_per_frame)
+    total_unique = sum(len(s) for s in unique_ids.values())
+
+    summary = pd.DataFrame([
+        ["Model", MODEL_NAME.replace(".pt", "")],
+        ["Mode", "Vehicles only" if mode == "1" else "All objects"],
+        ["Frames processed", frame_count],
+        ["Average FPS", round(avg_fps, 1)],
+        ["Average confidence", round(avg_conf, 3)],
+        [f"Average {word.lower()} per frame", round(avg_per_frame, 2)],
+        [f"Maximum {word.lower()} in one frame", max_in_frame],
+        [f"Total unique {word.lower()} (tracked)",
+         total_unique if use_track else "N/A (tracking off)"],
+    ], columns=["Metric", "Value"])
+
+    per_type = pd.DataFrame([
+        {
+            "Class": cname,
+            "Detections": detections[cid],
+            "Unique": len(unique_ids[cid]) if use_track else "N/A",
+            "Avg confidence": round(conf_sum[cid] / detections[cid], 3)
+            if detections[cid] else 0.0,
+        }
+        for cid, cname in classes.items()
+    ])
+
+    print("\n" + "=" * 60)
+    print("DETECTION SUMMARY")
+    print("=" * 60)
+    print(summary.to_string(index=False))
+    print("\nPER-CLASS RESULTS")
+    print(per_type.to_string(index=False))
+
+    summary.to_csv("detection_summary.csv", index=False)
+    per_type.to_csv("detection_per_type.csv", index=False)
+
+    # Chart: per-class bars + objects per frame
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
+
+    axes[0].bar(per_type["Class"], per_type["Detections"], color="#9a9a9a",
+                label="Detections")
+    if use_track:
+        axes[0].bar(per_type["Class"], per_type["Unique"],
+                    color="#222222", width=0.4, label="Unique")
+    axes[0].set_title(f"Fig. 1  {word} by type")
+    axes[0].set_ylabel("Count")
+    axes[0].tick_params(axis="x", rotation=40)
+    axes[0].legend()
+    axes[0].grid(axis="y", alpha=0.3)
+
+    axes[1].plot(counts_per_frame, color="#222222")
+    axes[1].set_title(f"Fig. 2  {word} visible per frame")
+    axes[1].set_xlabel("Frame number")
+    axes[1].set_ylabel(word)
+    axes[1].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig("detection_summary.png", dpi=200)
+    plt.close()
+
+    print("\nSaved: detection_summary.csv, detection_per_type.csv, "
+          "detection_summary.png")
+
+
+# ===============================================================
+# PART 2: ACCURACY EVALUATION (Precision, Recall, mAP, FPS)
+# ===============================================================
+def evaluate_models():
+    data = input("Dataset yaml (press Enter for coco128.yaml): ").strip()
+    if data == "":
+        data = "coco128.yaml"          # auto-downloads (~7 MB)
+
+    models = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"]
+    rows = []
+    per_class = {}
+
+    for name in models:
+        print(f"\n===== Evaluating {name} =====")
+        m = YOLO(name)
+
+        # conf=0.001 is the standard setting for computing AP
+        metrics = m.val(data=data, imgsz=IMGSZ, conf=0.001, iou=0.6,
+                        plots=False, verbose=False)
+
+        total_ms = sum(metrics.speed.values())
+        params_m = sum(p.numel() for p in m.model.parameters()) / 1e6
+        short = name.replace(".pt", "")
+
+        rows.append({
+            "Model": short,
+            "Params (M)": round(params_m, 1),
+            "Precision": round(float(metrics.box.mp), 4),
+            "Recall": round(float(metrics.box.mr), 4),
+            "mAP50 (%)": round(float(metrics.box.map50) * 100, 1),
+            "mAP50-95 (%)": round(float(metrics.box.map) * 100, 1),
+            "Time/img (ms)": round(total_ms, 1),
+            "FPS": round(1000 / total_ms, 1),
+        })
+
+        # Per-class results for Person, Bicycle, Car, Bike, Bus, Cat, Dog, Phone...
+        for i, cls_id in enumerate(metrics.box.ap_class_index):
+            if int(cls_id) in ALL_CLASSES:
+                per_class.setdefault(short, []).append({
+                    "Class": ALL_CLASSES[int(cls_id)],
+                    "Precision": round(float(metrics.box.p[i]), 4),
+                    "Recall": round(float(metrics.box.r[i]), 4),
+                    "AP50": round(float(metrics.box.ap50[i]), 4),
+                })
+
+    df = pd.DataFrame(rows)
+    print("\n" + "=" * 80)
+    print("TABLE 1: Model comparison")
+    print("=" * 80)
+    print(df.to_string(index=False))
+    df.to_csv("results_table.csv", index=False)
+
+    for mname, d in per_class.items():
+        print(f"\nTABLE 2: Object-class results for {mname}")
+        print(pd.DataFrame(d).to_string(index=False))
+        pd.DataFrame(d).to_csv(f"object_results_{mname}.csv", index=False)
+
+    x = range(len(df))
+    w = 0.38
+
+    # Fig: mAP
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.bar([i - w / 2 for i in x], df["mAP50 (%)"], w, label="mAP50", color="#9a9a9a")
+    ax.bar([i + w / 2 for i in x], df["mAP50-95 (%)"], w, label="mAP50-95", color="#222222")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(df["Model"])
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_xlabel("Models")
+    ax.set_title("Fig. 1  Detection accuracy (mAP)")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    for i, (a, b) in enumerate(zip(df["mAP50 (%)"], df["mAP50-95 (%)"])):
+        ax.text(i - w / 2, a + 0.5, f"{a}", ha="center", fontsize=8)
+        ax.text(i + w / 2, b + 0.5, f"{b}", ha="center", fontsize=8)
+    plt.tight_layout()
+    plt.savefig("fig1_map.png", dpi=200)
+    plt.close()
+
+    # Fig: Precision and Recall
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.bar([i - w / 2 for i in x], df["Precision"], w, label="Precision", color="#9a9a9a")
+    ax.bar([i + w / 2 for i in x], df["Recall"], w, label="Recall", color="#222222")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(df["Model"])
+    ax.set_ylim(0, 1.2)
+    ax.set_ylabel("Score")
+    ax.set_xlabel("Models")
+    ax.set_title("Fig. 2  Precision and Recall")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("fig2_precision_recall.png", dpi=200)
+    plt.close()
+
+    # Fig: Speed vs accuracy
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    ax.plot(df["FPS"], df["mAP50-95 (%)"], "o-", color="#222222")
+    for _, r in df.iterrows():
+        ax.annotate(r["Model"], (r["FPS"], r["mAP50-95 (%)"]),
+                    textcoords="offset points", xytext=(6, 6))
+    ax.set_xlabel("FPS (higher = faster)")
+    ax.set_ylabel("mAP50-95 (%)")
+    ax.set_title("Fig. 3  Speed vs accuracy")
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("fig3_speed_vs_accuracy.png", dpi=200)
+    plt.close()
+
+    print("\nSaved: results_table.csv, fig1_map.png, "
+          "fig2_precision_recall.png, fig3_speed_vs_accuracy.png")
+
+
+# ===============================================================
+# MAIN MENU
+# ===============================================================
+def main():
+    print("\n===== OBJECT DETECTION & VEHICLE COUNTER =====")
+    print("1. Live Camera")
+    print("2. Video File")
+    print("3. Evaluate Model (Precision, Recall, mAP, FPS)")
+
+    choice = input("Enter your choice (1/2/3): ").strip()
+
+    if choice in ("1", "2"):
+        print("\nWhat do you want to detect?")
+        print("1. Vehicles only (Car, Motorcycle, Bus, Truck)")
+        print("2. All objects (Person, Bicycle, Car, Motorcycle, Bus, Truck,")
+        print("                Cat, Dog, Mobile Phone)")
+        mode = input("Enter mode (1/2): ").strip()
+        if mode not in ("1", "2"):
+            print("Invalid mode")
+            return
+
+        model = YOLO(MODEL_NAME)          # load YOLO model
+        run_detection(choice, model, mode)
+    elif choice == "3":
+        evaluate_models()
+    else:
+        print("Invalid choice")
+
+
+if __name__ == "__main__":
+    main()
